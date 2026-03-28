@@ -18,12 +18,41 @@
 - DB 업테이트와 Kafka 메시지 발송이 서로 다른 트랜잭션으로 관리되어, 하나는 성공하고 하나는 실패하는 이중 쓰기 문제 발생
 해결
 - 메시지를 즉시 발송하지 않고 동일한 트랜잭션 내에서 Outbox 테이블에 저장, 별도의 Relay스케줄러가 이를 읽어 발행함으로써 메시지 발행의 원자성 확보
+```java
+@Transactional
+    public void startPayment(Long userId, String orderId, Long amount) throws JsonProcessingException {
+        Payment payment = paymentRepository.save(new Payment(userId, orderId, amount));
+
+        PaymentEvent event = new PaymentEvent(payment.getId(), userId, amount, orderId);
+        String payload = objectMapper.writeValueAsString(event);
+
+        outboxRepository.save(new Outbox("payment.requested", payload));
+
+    }
+```
 
 **멱등성 보장**
 이유
 - 카프카의 최소 한번 전달(At-Least-Once) 정책으로 인해 동일한 결제 완료 이벤트가 중복 수신되어 포인트가 이중차감될 위험이 존재
 해결
 - PointHistory 테이블에 paymentId 유니크 제약 조건을 설정하고, 로직 진입 전 처리 여부를 확인하는 로직을 배치하여 중복 처리 차단
+```java
+//이미 차감된 history에 기록된 것은 중복 방지
+        if (historyRepository.existsByPaymentId(event.getPaymentId())) return;
+
+        try {
+            // 차감 및 이력 저장
+            point.deduct(event.getAmount());
+            historyRepository.save(new PointHistory(event.getPaymentId(), event.getUserId(), event.getAmount()));
+
+            // 성공 시 정산으로 넘김
+            outboxRepository.save(new Outbox("settlement.process", objectMapper.writeValueAsString(event)));
+
+        } catch (InsufficientBalanceException e) {
+            // 포인트 부족 시: 이미 성공한 PG 결제를 취소하기 위해 이벤트 발행 (Saga Pattern)
+            outboxRepository.save(new Outbox("payment.cancel", objectMapper.writeValueAsString(event)));
+        }
+```
 
 **외부 API 호출의 정합성 유지**
 이유 
